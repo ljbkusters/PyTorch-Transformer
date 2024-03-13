@@ -56,30 +56,32 @@ def build_vocab(data: typing.Iterable[str],
     return vocab
 
 
-def _load_model(args: argparse.Namespace, logger: logging.Logger,
-                input_vocab: torchtext.vocab.Vocab,
-                output_vocab: torchtext.vocab.Vocab) -> seq2seq.Seq2Seq:
+def _get_fresh_model(args: argparse.Namespace, logger: logging.Logger,
+                     input_vocab: torchtext.vocab.Vocab,
+                     output_vocab: torchtext.vocab.Vocab) -> seq2seq.Seq2Seq:
     logger.info("Initializing new model")
-    encoder = seq2seq.S2SEncoder(vocab_input_size=len(input_vocab),
-                                 embedding_size=args.encoder_embedding_size,
-                                 hidden_size=args.hidden_size,
-                                 num_layers=args.num_layers,
-                                 p_dropout=args.encoder_dropout)
-    decoder = seq2seq.S2SDecoder(vocab_input_size=len(input_vocab),
-                                 vocab_output_size=len(output_vocab),
-                                 embedding_size=args.decoder_embedding_size,
-                                 hidden_size=args.hidden_size,
-                                 num_layers=args.num_layers,
-                                 p_dropout=args.decoder_dropout,
-                                 )
-    model = seq2seq.Seq2Seq(encoder=encoder,
-                            decoder=decoder,
-                            input_vocab=input_vocab,
-                            output_vocab=output_vocab,
-                            p_target_force_ratio=0.5)
-    if args.checkpoint is not None:
-        logger.warning("loading models is currently not supported!")
-    return model
+    config = seq2seq.Seq2SeqConfig(
+        encoder_config=seq2seq.S2SEncoderConfig(
+            vocab_input_size=len(input_vocab),
+            embedding_size=args.encoder_embedding_size,
+            hidden_size=args.hidden_size,
+            num_layers=args.num_layers,
+            p_dropout=args.encoder_dropout
+        ),
+        decoder_config=seq2seq.S2SDecoderConfig(
+            vocab_input_size=len(input_vocab),
+            vocab_output_size=len(output_vocab),
+            embedding_size=args.decoder_embedding_size,
+            hidden_size=args.hidden_size,
+            num_layers=args.num_layers,
+            p_dropout=args.decoder_dropout,
+        ),
+        input_vocab=input_vocab,
+        output_vocab=output_vocab,
+        p_train_target_force_ratio=0.5,
+    )
+    model = seq2seq.Seq2Seq.from_config(config)
+    return model, config
 
 
 def _get_device(args: argparse, logger: logging.Logger) -> torch.device:
@@ -164,6 +166,8 @@ def tokenize_data(input_vocab: torchtext.vocab.Vocab,
 def main(args: argparse.Namespace, logger: logging.Logger = LOGGER):
     """Trains a german to english translator"""
     # initialize data
+    if args.input_language == args.output_language:
+        raise RuntimeError("Input language equals output language!")
     train_data, valid_data = _get_raw_data(args)
     input_tokenizer, output_tokenizer = _get_tokenizers(args)
     input_vocab, output_vocab = _get_vocabs(args, input_tokenizer, output_tokenizer, train_data)
@@ -177,9 +181,12 @@ def main(args: argparse.Namespace, logger: logging.Logger = LOGGER):
                                           train_data, valid_data)
 
     # initialize model
-    model: seq2seq.Seq2Seq = _load_model(args, logger,
+    if args.checkpoint is None:
+        model, config = _get_fresh_model(args, logger,
                                          input_vocab=input_vocab,
                                          output_vocab=output_vocab)
+    else:
+        model, config = checkpointing.load_checkpoint_with_config(args.checkpoint)
     device: torch.device = _get_device(args, logger)
     model.to(device)
 
@@ -220,13 +227,32 @@ def main(args: argparse.Namespace, logger: logging.Logger = LOGGER):
 
             loss_running_average.append(loss.detach().item())
             tqdm_loader.set_postfix({"loss": sum(loss_running_average)/len(loss_running_average)})
-        checkpointing.save_checkpoint(model, ".model_checkpoints/s2s_checkpoint.pth.tar")
+        checkpointing.save_checkpoint_with_config(
+            model, config, ".model_checkpoints/s2s_checkpoint.pth.tar"
+            )
+
+
+def eval(args: argparse.Namespace, logger: logging.Logger):
+    model, config = checkpointing.load_checkpoint_with_config(args.checkpoint)
+    input_tokenizer = torchtext.data.utils.get_tokenizer('spacy', language="de",)
+    logging.info(f"input: {args.input}")
+    model.eval()
+    output = model.translate_sentence(args.input, input_tokenizer)
+    logging.info(f"output: {output}")
 
 
 if __name__ == "__main__":
     parser: argparse.ArgumentParser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="mode")
 
-    train_hp: argparse._ArgumentGroup = parser.add_argument_group("training_hyperparams")
+    # general arguments
+    logging_args = parser.add_argument_group("Logging arguments")
+    logging_args.add_argument("--log-level", type=str, default="INFO")
+
+    # train mode parser
+    train_parser = subparsers.add_parser("train", help="Train the model")
+    train_parser.set_defaults(func=main)
+    train_hp: argparse._ArgumentGroup = train_parser.add_argument_group("Training hyperparameters")
     train_hp.add_argument("--num-epochs", type=int, default=20)
     train_hp.add_argument("--learning-rate", type=float, default=1e-3)
     train_hp.add_argument("--batch-size", type=int, default=64)
@@ -237,7 +263,7 @@ if __name__ == "__main__":
                           choices=("de", "en"))
     train_hp.add_argument("--shuffle-batches", type=bool, default=True)
 
-    model_hp: argparse._ArgumentGroup = parser.add_argument_group("model_hyperparams")
+    model_hp: argparse._ArgumentGroup = train_parser.add_argument_group("Model hyperparameters")
     model_hp.add_argument("--checkpoint", type=str, default=None)
     model_hp.add_argument("--cpu", action="store_true", help="use the CPU even if GPU is available")
     model_hp.add_argument("--encoder-embedding-size", type=int, default=300)
@@ -249,11 +275,11 @@ if __name__ == "__main__":
     model_hp.add_argument("--decoder-dropout", type=float, default=0.5,
                           help="Dropout percentage in decoder")
 
-    # tensorboard_args: argparse._ArgumentGroup = parser.add_argument_group("tensorboard")
-    # tensorboard_args.add_argument("")
-
-    logging_args = parser.add_argument_group("logging_args")
-    logging_args.add_argument("--log-level", type=str, default="INFO")
+    # eval mode parser
+    eval_parser = subparsers.add_parser("eval", help="Run the model in eval mode")
+    eval_parser.set_defaults(func=eval)
+    eval_parser.add_argument("--checkpoint", type=str, help="path to checkpoint file")
+    eval_parser.add_argument("--input", dest="input", help="Input sentence to translate")
 
     args: argparse.Namespace = parser.parse_args()
 
@@ -267,7 +293,8 @@ if __name__ == "__main__":
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    if args.input_language == args.output_language:
-        raise RuntimeError("Input language equals output language!")
-
-    main(args)
+    # Check if a sub-command was provided
+    if not hasattr(args, 'func'):
+        parser.print_help()
+        exit(1)
+    args.func(args, LOGGER)
