@@ -196,19 +196,26 @@ def main(args: argparse.Namespace, logger: logging.Logger = LOGGER):
     tb_step: int = 0
 
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=input_vocab[PAD_TOKEN])
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
 
     loss_running_average = collections.deque([], maxlen=100)
+    test_sentence = "Ein Mädchen läuft entlang die Straße."
 
     for epoch in range(args.num_epochs):
         logger.info(f'Epoch [{epoch+1}/{args.num_epochs}]')
-        tqdm_loader = tqdm.tqdm(enumerate(train_dl))
-        for batch_idx, (input, target) in tqdm_loader:
-            input = input.to(device)
+        logger.info(f'test sentence: {test_sentence}')
+        model.eval()
+        logger.info(f'model output: {model.translate_sentence(test_sentence, input_tokenizer)}')
+        model.train()
+        tqdm_loader = tqdm.tqdm(train_dl)
+        for batch_idx, (input, target) in enumerate(tqdm_loader):
             logger.debug(f"input shape {input.shape}")
             logger.debug(f"target shape {target.shape}")
+            input = input.to(device)
             target = target.to(device)
 
+            logger.debug(f"input shape {input.shape}")
+            logger.debug(f"target shape {target.shape}")
             output = model(input, target)
 
             # check if this is still relevant...
